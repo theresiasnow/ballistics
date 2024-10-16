@@ -3,7 +3,7 @@ Ballistics functions for the ballistics calculator.
 input: os.environ['AIR_DENSITY'] need to be set to the air density in kg/m^3
 """
 import os
-from math import atan
+from math import atan, sin, radians, pi
 
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -460,3 +460,103 @@ def calculate_mrads(distances, pois):
         mrads.append(poi_to_mrad(pois[i], distances[i]))
     return mrads
 
+def runge_kutta_step(f, t, y, dt):
+    """
+    Performs a single step of the 4th-order Runge-Kutta method.
+
+    :param f: Function to integrate (dy/dt = f(t, y))
+    :param t: Current time
+    :param y: Current value of y
+    :param dt: Step size
+    :return: New value of y after taking the step
+    """
+    k1 = dt * f(t, y)
+    k2 = dt * f(t + dt / 2, y + k1 / 2)
+    k3 = dt * f(t + dt / 2, y + k2 / 2)
+    k4 = dt * f(t + dt, y + k3)
+    return y + (k1 + 2 * k2 + 2 * k3 + k4) / 6
+
+
+def coriolis_ode_x(t, y, vx, omega, phi):
+    """
+    Represents the differential equation related to the Coriolis effect in the x direction.
+
+    :param t: Time variable, not used in the current context but kept for generality
+    :param y: State variable for drift in the x direction
+    :param vx: Horizontal velocity of the object
+    :param omega: Angular velocity of the Earth
+    :param phi: Latitude in radians
+    :return: The derivative dy/dt (Coriolis force effect in x direction)
+    """
+    return 2 * vx * omega * np.sin(phi)
+
+
+def calculate_coriolis_with_rk(v0, drag_coefficient, bullet_weight, bullet_area, distances, latitude):
+    """
+    Calculate the Coriolis effect using the Runge-Kutta method over an array of distances, accounting for drag.
+
+    :param v0: Initial horizontal velocity of the object (vx) (m/s)
+    :param distances: Array of distances in meters (cumulative steps)
+    :param latitude: Latitude in degrees
+    :param drag_coefficient: Drag coefficient of the bullet
+    :param air_density: Air density in kg/m^3
+    :param bullet_area: Cross-sectional area of the bullet in m^2
+    :param bullet_weight: Mass of the bullet in kg
+    :return: A tuple containing the total drift and a list of drifts at each step
+    """
+    omega = 7.2921e-5  # Angular velocity of the Earth in rad/s
+    phi = np.radians(latitude)
+
+    # Initial conditions
+    y = 0  # Initial state variable for x direction drift
+    drifts = [0]  # Initial drift as 0 for starting point
+
+    vx = v0  # Initial horizontal velocity
+    for i in range(1, len(distances)):
+        dt = (distances[i] - distances[i - 1]) / vx  # Time step based on distance interval and velocity
+
+        # Calculate drag force and update horizontal velocity
+        drag_force = calculate_drag_force(vx, drag_coefficient, bullet_area)
+        acceleration_due_to_drag = drag_force / bullet_weight
+        vx -= acceleration_due_to_drag * dt  # Update velocity considering drag
+
+        # Calculate the next state using Runge-Kutta step function
+        y = runge_kutta_step(lambda t, y: coriolis_ode_x(t, y, vx, omega, phi), 0, y, dt)
+        drifts.append(y)  # Increment and store drift
+
+    total_drift = drifts[-1]  # Final drift value
+
+    return total_drift, drifts
+
+def calculate_spin_drift(v0, drag_coefficient, target_distance, bullet_weight, bullet_area, twist_rate):
+    """
+    Estimate spin drift for a given bullet at a specified range.
+
+    :param target_distance: Range to the target in meters
+    :param v0: Muzzle velocity of the bullet in m/s
+    :param bullet_length: Length of the bullet in meters
+    :param twist_rate: Twist rate of the rifling (in meters per revolution, e.g., 1:7 twist = 0.1778 m/rev)
+    :return: Spin drift in meters
+    """
+
+    # Calculate velocity at the given distance considering drag
+    velocity = calculate_velocity_at_distance(v0, drag_coefficient, bullet_weight, bullet_area, target_distance)
+
+    # Bullet spin rate (radians per second)
+    spin_rate = (2 * pi * velocity) / twist_rate
+
+    # Empirical constant for spin drift (this value can be adjusted based on experimental data)
+    k = 2.25e-6  # Adjust based on bullet type
+    # Simplified estimation of the gyroscopic effect
+    spin_drift = (spin_rate * target_distance ** 2) / (v0 ** 2)
+
+    # Multiply by empirical constant
+    adjusted_spin_drift = k * spin_drift
+
+    return adjusted_spin_drift
+
+def calculate_spin_drifts(v0, distances, drag_coefficient, bullet_weight, bullet_area, twist_rate):
+    drifts = []
+    for d in distances:
+        drifts.append(calculate_spin_drift(v0, drag_coefficient, d, bullet_weight, bullet_area, twist_rate))
+    return drifts
