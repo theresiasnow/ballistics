@@ -15,12 +15,15 @@ G = 9.82  # Acceleration due to gravity in m/s^2
 
 
 def get_air_density() -> float:
+    """
+    Get the air density from the environment variable AIR_DENSITY.
+    :return: Air density in kg/m^3
+    """
     air_density_env = os.getenv('AIR_DENSITY')
     if air_density_env is None:
         print("air density not set using default")
         return DEFAULT_AIR_DENSITY
     return float(air_density_env)
-
 
 def calculate_air_density(temperature: float = None, pressure: float = None, humidity: float = None) -> float:
     """
@@ -63,7 +66,6 @@ def calculate_air_density(temperature: float = None, pressure: float = None, hum
 
     return density
 
-
 # Correct drag coefficient calculation to handle unit consistency
 # Convert BC from imperial to metric:
 def convert_bc_to_metric(bc):
@@ -81,7 +83,6 @@ def convert_bc_to_metric(bc):
     inch_to_meter = INCHES_TO_METERS_FACTOR  # Conversion factor from inches to meters
     bc_metric = bc / inch_to_meter ** 2  # Adjust BC for metric units
     return bc_metric
-
 
 def calculate_velocity_T(v0, t, bc):
     """
@@ -127,7 +128,6 @@ def calculate_drag_force(v, drag_coefficient, bullet_area):
     """
     return 0.5 * drag_coefficient * get_air_density() * v ** 2 * bullet_area
 
-
 def calculate_barrel_angle(hob, poi, d0):
     """
     Calculate the barrel angle required to hit a target.
@@ -141,7 +141,6 @@ def calculate_barrel_angle(hob, poi, d0):
     float: Barrel angle in radians.
     """
     return atan((hob + poi) / d0)  # Angle in radians
-
 
 def calculate_velocity_at_distance(v0, drag_coefficient, bullet_weight, bullet_area, distance, dt=0.01):
     """
@@ -265,8 +264,6 @@ def calculate_time_of_flights(v0, drag_coefficient_g1, bullet_weight, bullet_are
             calculate_time_of_flight(v0, drag_coefficient_g1, bullet_weight, bullet_area, d, angle_rad))
     return time_to_distances
 
-
-# Define the bullet trajectory with drag affecting both x and y velocities
 def bullet_trajectory(t, y, drag_coefficient, bullet_weight, bullet_area):
     """
     Define the bullet trajectory with drag affecting both x and y velocities.
@@ -396,7 +393,7 @@ def calculate_mrads(distances, pois):
     return mrads
 
 
-def calculate_coriolis_drift(v0, drag_coefficient, bullet_weight, bullet_area, distances, latitude):
+def calculate_coriolis_drifts(v0, drag_coefficient, bullet_weight, bullet_area, distances, latitude):
     """
     Calculate the Coriolis effect using the solve_ivp method over an array of distances, accounting for drag.
 
