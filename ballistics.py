@@ -66,6 +66,34 @@ def calculate_air_density(temperature: float = None, pressure: float = None, hum
 
     return density
 
+def calculate_true_ballistic_range(distance, angle, k=0.0):
+    """
+    Calculate the true ballistic range considering the angle and an optional constant.
+
+    Parameters:
+    distance (float): The horizontal distance in meters.
+    angle (float): The angle of elevation in degrees.
+    k (float, optional): An optional constant to adjust the range. Default is 0.0.
+
+    Returns:
+    float: The true ballistic range in meters.
+    """
+    return distance * cos(radians(angle)) + k
+
+def calculate_true_ballistic_ranges(distances, angle, k=0.0):
+    """
+    Calculate the true ballistic ranges for multiple distances considering the angle and an optional constant.
+
+    Parameters:
+    distances (list[float]): List of horizontal distances in meters.
+    angle (float): The angle of elevation in degrees.
+    k (float, optional): An optional constant to adjust the range. Default is 0.0.
+
+    Returns:
+    np.array: Array of true ballistic ranges in meters.
+    """
+    return np.array([calculate_true_ballistic_range(d, angle, k) for d in distances])
+
 # Correct drag coefficient calculation to handle unit consistency
 # Convert BC from imperial to metric:
 def convert_bc_to_metric(bc):
@@ -134,7 +162,7 @@ def calculate_barrel_angle(hob, poi, d0):
 
     Parameters:
     hob (float): Height over bore in meters.
-    poi (float): Point of impact in meters (negative if below the target).
+    k (float): Point of impact in meters (negative if below the target).
     d0 (float): Distance to the target in meters.
 
     Returns:
@@ -155,7 +183,6 @@ def calculate_velocity_at_distance(v0, drag_coefficient, bullet_weight, bullet_a
     Returns:
     float: Velocity at the given distance in m/s.
     """
-
     def velocity_ode(t, v, drag_coefficient, bullet_weight, bullet_area):
         return -calculate_drag_force(v, drag_coefficient, bullet_area) / bullet_weight
 
@@ -365,7 +392,7 @@ def poi_to_mrad(poi, d):
     Convert point of impact (POI) to milliradians (mrad).
 
     Parameters:
-    poi (float): Point of impact in meters.
+    k (float): Point of impact in meters.
     d (float): Distance to the target in meters.
 
     Returns:
