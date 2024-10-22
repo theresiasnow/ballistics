@@ -2,29 +2,19 @@
 Ballistics functions for the ballistics calculator.
 input: os.environ['AIR_DENSITY'] need to be set to the air density in kg/m^3
 """
+import math
 import os
 from math import atan, cos, radians, pi
 
 import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.optimize import fsolve
+import util as util
 
 # Constants
-DEFAULT_AIR_DENSITY = 1.225  # Default air density in kg/m^3 at 15°C, sea level
 INCHES_TO_METERS_FACTOR = 0.0254
+KMH_TO_MPS = 1000 / 3600  # Conversion factor from km/h to m/s
 G = 9.82  # Acceleration due to gravity in m/s^2
-
-
-def get_air_density() -> float:
-    """
-    Get the air density from the environment variable AIR_DENSITY.
-    :return: Air density in kg/m^3
-    """
-    air_density_env = os.getenv('AIR_DENSITY')
-    if air_density_env is None:
-        print("air density not set using default")
-        return DEFAULT_AIR_DENSITY
-    return float(air_density_env)
 
 def bullet_dynamics(t, y, drag_coefficient, bullet_mass, bullet_area, wind_speed=0.0, wind_angle=0.0):
     """
@@ -118,7 +108,7 @@ def calculate_air_density(temperature: float = None, pressure: float = None, hum
         return 6.1078 * 10 ** (7.5 * T / (T + 237.3)) * 100  # Convert from hPa to Pa
 
     if temperature is None or pressure is None or humidity is None:
-        return DEFAULT_AIR_DENSITY
+        return util.DEFAULT_AIR_DENSITY
 
     # Calculate the saturation vapor pressure at the given temperature
     p_sat = saturation_vapor_pressure(temperature)
@@ -208,7 +198,7 @@ def calculate_drag_force(v, drag_coefficient, bullet_area):
     Returns:
     float: Drag force in N.
     """
-    return 0.5 * drag_coefficient * get_air_density() * v ** 2 * bullet_area
+    return 0.5 * drag_coefficient * util.get_air_density() * v ** 2 * bullet_area
 
 def calculate_barrel_angle(hob, poi, d0):
     """
@@ -504,6 +494,8 @@ def calculate_mrads(distances, pois):
         mrads.append(poi_to_mrad(pois[i], distances[i]))
     return mrads
 
+def angle_to_mrads(angle: float, distance: float) -> float:
+    return angle / distance * 1000.0
 
 def calculate_coriolis_drifts(v0, drag_coefficient, bullet_mass, bullet_area, distances, latitude):
     """
@@ -739,6 +731,53 @@ def calculate_mpbr(v0, drag_coefficient, bullet_mass, bullet_area, target_size, 
 
     return mpbr
 
+def calculate_hold_mrad(target_speed, distance, flight_time):
+    """
+    Calculate the hold (lead) for a moving target in milliradians (mrad).
+
+    Parameters:
+    target_speed (float): Speed of the target in meters per second (m/s).
+    distance (float): Distance to the target in meters (m).
+    flight_time (float): Flight time of the projectile in seconds (s).
+
+    Returns:
+    float: Required hold (lead) in milliradians (mrad).
+    """
+    # The hold is the product of the target's speed and the flight time of the projectile
+
+    if distance <=0:
+        return 0
+    hold_m = target_speed * flight_time
+    # Convert hold to milliradians
+    hold_mrad = (hold_m / distance) * 1000
+    return hold_mrad
+
+def create_hold_table(vt_arr, d_arr, t_arr):
+    """
+    Create a table of holds for a range of target speeds and distances.
+
+    Parameters:
+    vt_arr (array-like): Array of target speeds in km/h.
+    d_arr (array-like): Array of distances to the target in meters.
+
+    Returns:
+    np.array: 2D array of holds in milliradians (mrad).
+    """
+    # Check that the lengths of d_arr and t_arr are the same
+    if len(d_arr) != len(t_arr):
+        raise ValueError("Distances, velocities and flight times arrays must be the same length.")
+
+    # Initialize an empty table to store the holds
+    hold_table = np.zeros((len(vt_arr), len(d_arr)))
+    # Recaculate velocities to m/s
+    vt_arr = np.array(vt_arr) * KMH_TO_MPS
+
+    # Calculate the hold for each combination of target speed and distance
+    for i, vt in enumerate(vt_arr):
+        for j, d in enumerate(d_arr):
+            hold_table[j, i] = np.round(calculate_hold_mrad(vt, d, t_arr[j]), 1)
+    return hold_table
+
 def calculate_projectile_3d_trajectory(v0, drag_coefficient, distance, bullet_weight, bullet_area, angle, wind_speed=0, wind_angle=0, dt=0.01):
     """
     Compute the projectile trajectory in 3D space at discrete time intervals.
@@ -757,7 +796,6 @@ def calculate_projectile_3d_trajectory(v0, drag_coefficient, distance, bullet_we
 
     # Time span
     t_max = 1.5 * distance / v0x
-
     t_span = (0, t_max)
     t_eval = np.arange(0, t_max, dt)  # Discrete time intervals
 
