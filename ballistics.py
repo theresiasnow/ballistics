@@ -3,7 +3,6 @@ Ballistics functions for the ballistics calculator.
 input: os.environ['AIR_DENSITY'] need to be set to the air density in kg/m^3
 """
 import math
-import os
 from math import atan, cos, radians, pi
 
 import numpy as np
@@ -731,28 +730,30 @@ def calculate_mpbr(v0, drag_coefficient, bullet_mass, bullet_area, target_size, 
 
     return mpbr
 
-def calculate_hold_mrad(target_speed, distance, flight_time):
+def calculate_hold_mrad(target_speed, target_distance, target_angle, flight_time):
     """
     Calculate the hold (lead) for a moving target in milliradians (mrad).
 
     Parameters:
     target_speed (float): Speed of the target in meters per second (m/s).
-    distance (float): Distance to the target in meters (m).
+    target_distance (float): Distance to the target in meters (m).
+    target_angle (float): Angle of the target's motion in degrees.
     flight_time (float): Flight time of the projectile in seconds (s).
 
     Returns:
     float: Required hold (lead) in milliradians (mrad).
+    :param target_angle:
     """
     # The hold is the product of the target's speed and the flight time of the projectile
 
-    if distance <=0:
+    if target_distance <=0:
         return 0
-    hold_m = target_speed * flight_time
+    hold_m = target_speed * flight_time * math.cos(radians(target_angle))
     # Convert hold to milliradians
-    hold_mrad = (hold_m / distance) * 1000
+    hold_mrad = (hold_m / target_distance) * 1000
     return hold_mrad
 
-def create_hold_table(vt_arr, d_arr, t_arr):
+def create_hold_table(vt_arr, d_arr, t_arr, target_angle=0):
     """
     Create a table of holds for a range of target speeds and distances.
 
@@ -769,13 +770,13 @@ def create_hold_table(vt_arr, d_arr, t_arr):
 
     # Initialize an empty table to store the holds
     hold_table = np.zeros((len(vt_arr), len(d_arr)))
-    # Recaculate velocities to m/s
+    # Recalculate velocities to m/s
     vt_arr = np.array(vt_arr) * KMH_TO_MPS
 
     # Calculate the hold for each combination of target speed and distance
     for i, vt in enumerate(vt_arr):
         for j, d in enumerate(d_arr):
-            hold_table[j, i] = np.round(calculate_hold_mrad(vt, d, t_arr[j]), 1)
+            hold_table[j, i] = np.round(calculate_hold_mrad(vt, d, target_angle, t_arr[j]), 1)
     return hold_table
 
 def calculate_projectile_3d_trajectory(v0, drag_coefficient, distance, bullet_weight, bullet_area, angle, wind_speed=0, wind_angle=0, dt=0.01):
