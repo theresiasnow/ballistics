@@ -699,7 +699,7 @@ def calculate_mpbr(v0, drag_coefficient, bullet_mass, bullet_area, target_size, 
     y0 = [0, -hob, 0, v0x, v0y, v0z]  # [x0, y0, z0, vx0, vy0, vz0]
 
     # Estimate the maximum time of flight based on typical flight times
-    t_max = 2 * d_zero / v0  # Rough estimate of max time
+    t_max = calculate_time_of_flight(v0, drag_coefficient, bullet_mass, bullet_area, d_zero, angle) * 2
     t_span = [0, t_max]
 
     # Solve the ODE using your bullet_dynamics function
@@ -708,7 +708,7 @@ def calculate_mpbr(v0, drag_coefficient, bullet_mass, bullet_area, target_size, 
         t_span,
         y0,
         args=(drag_coefficient, bullet_mass, bullet_area),
-        method='RK45',
+        method='LSODA',
         dense_output=True,
         rtol=1e-8,
         atol=1e-10
