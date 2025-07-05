@@ -779,43 +779,56 @@ def create_hold_table(vt_arr, d_arr, t_arr, target_angle=0):
             hold_table[j, i] = np.round(calculate_hold_mrad(vt, d, target_angle, t_arr[j]), 1)
     return hold_table
 
-def calculate_projectile_3d_trajectory(v0, drag_coefficient, distance, bullet_weight, bullet_area, angle, wind_speed=0, wind_angle=0, dt=0.01):
+def calculate_projectile_3d_trajectory(v0, drag_coefficient, distance, bullet_weight, bullet_area,
+                                       angle, hob, wind_speed=0, wind_angle=0, dt=0.01):
     """
-    Compute the projectile trajectory in 3D space at discrete time intervals.
+    Simulate 3D bullet trajectory and stop integration exactly at given distance.
+    """
 
-    Returns:
-    x_vals, y_vals, z_vals: Arrays of positions in the X, Y, and Z dimensions.
-    """
-    # Convert wind angle to radians
     wind_angle = np.radians(wind_angle)
-
-    # Initial conditions
-    v0x = v0 * np.cos(angle)  # Initial velocity in x-direction
-    v0y = v0 * np.sin(angle)  # Initial velocity in y-direction
-    v0z = 0  # Initial velocity in z-direction (no initial drift)
-    y0 = [0, 0, 0, v0x, v0y, v0z]
-
-    # Time span
+    v0x = v0 * np.cos(angle)
+    v0y = v0 * np.sin(angle)
+    v0z = 0.0
+    y0 = [0.0, hob, 0.0, v0x, v0y, v0z]
     t_max = 1.5 * distance / v0x
-    t_span = (0, t_max)
-    t_eval = np.arange(0, t_max, dt)  # Discrete time intervals
+    t_eval = np.arange(0, t_max, dt)
 
-    # Solve the ODE
+    def make_stop_at_distance_event(target_x):
+        def event(t, y, *args):
+            return y[0] - target_x
+        event.terminal = True
+        event.direction = 1
+        return event
+
+    stop_event = make_stop_at_distance_event(distance)
+
     sol = solve_ivp(
-        bullet_dynamics,
-        t_span,
-        y0,
-        t_eval=t_eval,
+        fun=bullet_dynamics,
+        t_span=(0, t_max),
+        y0=y0,
         args=(drag_coefficient, bullet_weight, bullet_area, wind_speed, wind_angle),
+        t_eval=t_eval,
+        events=stop_event,
         method='LSODA',
+        dense_output=True,  # <--- important
         rtol=1e-8,
         atol=1e-10
     )
 
-    # Extract x, y, z values
-    x_vals = sol.y[0]
-    y_vals = sol.y[1]
-    z_vals = sol.y[2]
+    if sol.t_events[0].size > 0:
+        impact_time = sol.t_events[0][0]
+        dense_point = sol.sol(impact_time)  # interpolated state [x, y, z, vx, vy, vz]
+
+        mask = sol.t < impact_time
+        x_vals = np.append(sol.y[0][mask], dense_point[0])
+        y_vals = np.append(sol.y[1][mask], dense_point[1])
+        z_vals = np.append(sol.y[2][mask], dense_point[2])
+        t_eval = np.append(sol.t[mask], impact_time)
+    else:
+        x_vals = sol.y[0]
+        y_vals = sol.y[1]
+        z_vals = sol.y[2]
+        t_eval = sol.t
 
     return x_vals, y_vals, z_vals, t_eval
 
