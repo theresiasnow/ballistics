@@ -6,7 +6,7 @@ from matplotlib import pyplot as plt
 def plot_hold_table(hold_table, vts, distances):
     df = pd.DataFrame(hold_table, columns=vts, index=distances)
     df.index.name = 'd (m)'
-    df.columns.name = 'v (km/h)'
+    df.columns.name = 'v (km/hob)'
     # Adjust Jupyter notebook display settings for better visibility
     pd.set_option('display.max_rows', None)
     pd.set_option('display.max_columns', None)
@@ -42,7 +42,7 @@ def save_hold_table(df):
     plt.text(0.5, 0.8, caption, horizontalalignment='center', fontsize=18, transform=ax.transAxes)
 
     # Add labels for speed (columns) and distance (rows)
-    plt.text(0.5, 0.2, 'Speed (km/h)', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes,
+    plt.text(0.5, 0.2, 'Speed (km/hob)', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes,
              fontsize=12)
     plt.text(-0.16, 0.5, 'Distance (m)', horizontalalignment='center', verticalalignment='center',
              transform=ax.transAxes, fontsize=12, rotation='vertical')

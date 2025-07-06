@@ -12,7 +12,7 @@ import util as util
 
 # Constants
 INCHES_TO_METERS_FACTOR = 0.0254
-KMH_TO_MPS = 1000 / 3600  # Conversion factor from km/h to m/s
+KMH_TO_MPS = 1000 / 3600  # Conversion factor from km/hob to m/s
 G = 9.82  # Acceleration due to gravity in m/s^2
 
 def bullet_dynamics(t, y, drag_coefficient, bullet_mass, bullet_area, wind_speed=0.0, wind_angle=0.0):
@@ -77,7 +77,7 @@ def calibrate_zero(v0, d_zero, drag_coefficient_g1, bullet_weight, bullet_area, 
     def find_angle(a):
         # a is passed as an array, so we extract the scalar value using a[0]
         a = a[0]
-        #    return b.calculate_poi(v0, d_zero, drag_coefficient_g1, bullet_mass, bullet_area, h, a)
+        #    return b.calculate_poi(v0, d_zero, drag_coefficient_g1, bullet_mass, bullet_area, hob, a)
         return calculate_poi(v0, d_zero, drag_coefficient_g1, bullet_weight, bullet_area, hob, a)
 
     # Use fsolve to find the correct angle
@@ -758,7 +758,7 @@ def create_hold_table(vt_arr, d_arr, t_arr, target_angle=0):
     Create a table of holds for a range of target speeds and distances.
 
     Parameters:
-    vt_arr (array-like): Array of target speeds in km/h.
+    vt_arr (array-like): Array of target speeds in km/hob.
     d_arr (array-like): Array of distances to the target in meters.
 
     Returns:
