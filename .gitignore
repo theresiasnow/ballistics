@@ -254,4 +254,9 @@ cython_debug/
 #.idea/
 
 !/.venv/
-!/.venv/
+
+# Generated ballistics outputs
+parameters.json
+ballistic_table.pdf
+hold_table.pdf
+bullet_trajectory_3d.gif
