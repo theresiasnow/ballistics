@@ -1,89 +1,184 @@
 """
 Ballistics functions for the ballistics calculator.
-input: os.environ['AIR_DENSITY'] need to be set to the air density in kg/m^3
+
+The simulation is a point-mass model with a Mach-dependent standard drag
+function (G1 or G7). The retardation experienced by a bullet is
+
+    a_drag = (pi / 8) * rho * v^2 * Cd_ref(Mach) / BC
+
+where BC is the ballistic coefficient in SI area-density units (kg/m^2) and
+Cd_ref(Mach) is the standard reference drag coefficient from `drag_tables`.
+The bullet's own mass and diameter cancel out of this expression, so the only
+projectile inputs needed for the trajectory are the BC and the drag model.
+
+input: os.environ['AIR_DENSITY'] must be set to the air density in kg/m^3
+       (use util.set_air_density()).
 """
 import math
+from dataclasses import dataclass
 from math import atan, cos, radians, pi
 
 import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.optimize import fsolve
+
 import util as util
+from drag_tables import DragModel, speed_of_sound
 
 # Constants
-INCHES_TO_METERS_FACTOR = 0.0254
-KMH_TO_MPS = 1000 / 3600  # Conversion factor from km/hob to m/s
+INCHES_TO_METERS_FACTOR = 0.0254  # m per inch
+POUNDS_TO_KG_FACTOR = 0.45359237  # kg per pound
+GRAINS_TO_KG_FACTOR = 0.00006479891  # kg per grain
+KMH_TO_MPS = 1000 / 3600  # Conversion factor from km/h to m/s
 G = 9.82  # Acceleration due to gravity in m/s^2
 
-def bullet_dynamics(t, y, drag_coefficient, bullet_mass, bullet_area, wind_speed=0.0, wind_angle=0.0):
+# Earth rotation rate, used by the Coriolis model.
+EARTH_OMEGA = 7.2921159e-5  # rad/s
+
+# Default drag model used when a caller does not supply one. A bullet's BC is
+# only meaningful together with the reference drag function it was measured
+# against, so this default and the BC must agree (a G1 BC needs the G1 model).
+DEFAULT_DRAG_MODEL = DragModel("G1")
+
+
+@dataclass(frozen=True)
+class Load:
+    """A named rifle/ammunition/scope combination.
+
+    Fields use the units a shooter reads off a box or data sheet (grains,
+    inches, lb/in^2). The SI values the simulation needs are exposed as derived
+    properties, so notebook code never has to do unit conversions by hand.
+    """
+
+    name: str
+    v0: float                       # Muzzle velocity, m/s
+    bc: float                       # Ballistic coefficient, lb/in^2
+    drag_model: str = "G1"          # Reference drag function: "G1" or "G7"
+    bullet_mass_gr: float = 0.0     # Bullet mass, grains
+    bullet_diameter_in: float = 0.224  # Bullet diameter, inches
+    bullet_length_in: float = 0.0   # Bullet length, inches
+    twist_in: float = 0.0           # Barrel twist, inches per turn
+    sight_height_mm: float = 70.0   # Sight height over bore, mm
+    zero_distance_m: float = 100.0  # Zero distance, m
+
+    @property
+    def bc_metric(self) -> float:
+        """Ballistic coefficient in SI area-density units (kg/m^2)."""
+        return convert_bc_to_metric(self.bc)
+
+    @property
+    def drag(self) -> DragModel:
+        """The standard drag function (G1/G7) this load's BC was measured against."""
+        return DragModel(self.drag_model)
+
+    @property
+    def bullet_mass_kg(self) -> float:
+        return self.bullet_mass_gr * GRAINS_TO_KG_FACTOR
+
+    @property
+    def bullet_diameter_m(self) -> float:
+        return self.bullet_diameter_in * INCHES_TO_METERS_FACTOR
+
+    @property
+    def bullet_length_m(self) -> float:
+        return self.bullet_length_in * INCHES_TO_METERS_FACTOR
+
+    @property
+    def twist_m(self) -> float:
+        return self.twist_in * INCHES_TO_METERS_FACTOR
+
+    @property
+    def sight_height_m(self) -> float:
+        return self.sight_height_mm / 1000.0
+
+
+def _resolve_model(drag_model):
+    """Return a usable DragModel, falling back to the G1 default."""
+    return drag_model if drag_model is not None else DEFAULT_DRAG_MODEL
+
+
+def _ref_cd(velocity, drag_model):
+    """Reference drag coefficient at the given speed for the drag model.
+
+    The Mach number uses the speed of sound at the current firing air
+    temperature (set via util.set_air_temperature), not a fixed 15 °C, so the
+    drag-curve lookup is correct for the conditions. This matters downrange:
+    a wrong speed of sound shifts every Cd lookup and compounds with range.
+    """
+    mach = velocity / speed_of_sound(util.get_air_temperature())
+    return _resolve_model(drag_model).cd(mach)
+
+
+def bullet_dynamics(t, y, bc_metric, drag_model=None, wind_speed=0.0, wind_angle=0.0):
     """
     Compute the time derivatives of position and velocity for the bullet.
 
-    y: Array of [x, y, vx, vy] where:
-        x: horizontal position (m)
-        y: vertical position (m)
-        vx: horizontal velocity (m/s)
-        vy: vertical velocity (m/s)
+    Parameters:
+    bc_metric (float): Ballistic coefficient in SI area-density units (kg/m^2),
+        i.e. the imperial BC converted with `convert_bc_to_metric`.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
+    wind_speed (float): Wind speed in m/s.
+    wind_angle (float): Wind direction in radians, relative to the line of fire.
 
-    Returns: derivatives [vx, vy, ax, ay] where:
-        ax: horizontal acceleration (m/s^2)
-        ay: vertical acceleration (m/s^2)
+    y: Array of [x, y, z, vx, vy, vz] (positions in m, velocities in m/s).
+
+    Returns: derivatives [vx, vy, vz, ax, ay, az] (m/s and m/s^2).
     """
     x, y_pos, z, vx, vy, vz = y
 
-    # Wind components in m/s (wind direction relative to bullet's path)
+    # Wind components in m/s (wind direction relative to the line of fire)
     wind_vx = wind_speed * np.cos(wind_angle)
     wind_vz = wind_speed * np.sin(wind_angle)
 
-    # Relative velocities in m/s
+    # Velocity relative to the air mass (drag acts on airspeed, not groundspeed)
     relative_vx = vx - wind_vx
     relative_vy = vy  # Assuming no vertical wind component
     relative_vz = vz - wind_vz
 
-    # Total relative velocity magnitude in m/s
+    # Airspeed magnitude in m/s
     relative_velocity = np.sqrt(relative_vx ** 2 + relative_vy ** 2 + relative_vz ** 2)
 
-    # Drag force in Newtons (N)
-    # drag_force = 0.5 * drag_coefficient * bullet_area * air_density * relative_velocity ** 2
-    drag_force = calculate_drag_force(relative_velocity, drag_coefficient, bullet_area)
+    # Retardation coefficient k such that the drag deceleration magnitude is
+    # k * v^2, acting opposite the airspeed vector:
+    #   a_drag = (pi / 8) * rho * Cd_ref(Mach) / BC * v^2
+    rho = util.get_air_density()
+    cd_ref = _ref_cd(relative_velocity, drag_model)
+    k = (pi / 8.0) * rho * cd_ref / bc_metric
 
-    # Accelerations in m/s²
-    ax = -(drag_force * relative_vx) / (bullet_mass * relative_velocity)
-    ay = -G - (drag_force * relative_vy) / (bullet_mass * relative_velocity)
-    az = -(drag_force * relative_vz) / (bullet_mass * relative_velocity)
+    # Accelerations in m/s^2: drag opposes airspeed, gravity acts on -y.
+    ax = -k * relative_velocity * relative_vx
+    ay = -G - k * relative_velocity * relative_vy
+    az = -k * relative_velocity * relative_vz
 
     return [vx, vy, vz, ax, ay, az]
 
-def calibrate_zero(v0, d_zero, drag_coefficient_g1, bullet_weight, bullet_area, hob):
+
+def calibrate_zero(v0, d_zero, bc_metric, hob, drag_model=None):
     """
     Calibrate the barrel angle to achieve a zero point at a specified distance.
 
     Parameters:
     v0 (float): Initial velocity of the bullet in m/s.
     d_zero (float): Distance to the zero point in meters.
-    drag_coefficient_g1 (float): Drag coefficient of the bullet (G1 model).
-    bullet_weight (float): Weight of the bullet in kg.
-    bullet_area (float): Cross-sectional area of the bullet in m^2.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
     hob (float): Height over bore in meters.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
 
     Returns:
     float: The calibrated barrel angle in radians.
     """
     print("Calibrating zero...")
-    # Initial guess for the angle
     angle_guess = 0
 
-    # Function to find the angle that makes y(d_target) = 0 (hit the target at height zero)
+    # Find the angle that makes the point of impact zero at the zero distance.
     def find_angle(a):
-        # a is passed as an array, so we extract the scalar value using a[0]
-        a = a[0]
-        #    return b.calculate_poi(v0, d_zero, drag_coefficient_g1, bullet_mass, bullet_area, hob, a)
-        return calculate_poi(v0, d_zero, drag_coefficient_g1, bullet_weight, bullet_area, hob, a)
+        # fsolve passes the unknown as a 1-element array.
+        return calculate_poi(v0, d_zero, bc_metric, hob, a[0], drag_model)
 
-    # Use fsolve to find the correct angle
     result = fsolve(find_angle, angle_guess)
-    print("Calibration complete. Barrel angle:", result[0])
+    print("Calibration complete. Barrel angle (rad):", result[0])
     return result[0]
+
 
 def calculate_air_density(temperature: float = None, pressure: float = None, humidity: float = None) -> float:
     """
@@ -126,78 +221,63 @@ def calculate_air_density(temperature: float = None, pressure: float = None, hum
 
     return density
 
+
 def calculate_true_ballistic_range(distance, angle, k=0.0):
     """
-    Calculate the true ballistic range considering the angle and an optional constant.
+    Calculate the gravity-effective (horizontal) range for an inclined shot.
+
+    Only the horizontal component of range is acted on by the full drop of
+    gravity; for an up- or down-hill shot of slant distance `distance` at
+    inclination `angle`, the effective range is distance * cos(angle). This is
+    the basis of the "rifleman's rule".
 
     Parameters:
-    distance (float): The horizontal distance in meters.
-    angle (float): The angle of elevation in degrees.
-    k (float, optional): An optional constant to adjust the range. Default is 0.0.
+    distance (float): Slant (line-of-sight) distance in meters.
+    angle (float): Inclination angle in degrees (0 = horizontal).
+    k (float, optional): Optional additive offset in meters. Default 0.0.
 
     Returns:
-    float: The true ballistic range in meters.
+    float: The gravity-effective horizontal range in meters.
     """
     return distance * cos(radians(angle)) + k
 
+
 def calculate_true_ballistic_ranges(distances, angle, k=0.0):
     """
-    Calculate the true ballistic ranges for multiple distances considering the angle and an optional constant.
+    Vectorized `calculate_true_ballistic_range` over a list of slant distances.
 
     Parameters:
-    distances (list[float]): List of horizontal distances in meters.
-    angle (float): The angle of elevation in degrees.
-    k (float, optional): An optional constant to adjust the range. Default is 0.0.
+    distances (list[float]): Slant distances in meters.
+    angle (float): Inclination angle in degrees (0 = horizontal).
+    k (float, optional): Optional additive offset in meters. Default 0.0.
 
     Returns:
-    np.array: Array of true ballistic ranges in meters.
+    np.array: Array of gravity-effective horizontal ranges in meters.
     """
     return np.array([calculate_true_ballistic_range(d, angle, k) for d in distances])
 
-# Correct drag coefficient calculation to handle unit consistency
-# Convert BC from imperial to metric:
+
 def convert_bc_to_metric(bc):
     """
-    Convert ballistic coefficient (BC) from imperial to metric units.
+    Convert a ballistic coefficient from imperial (lb/in^2) to SI (kg/m^2).
+
+    A ballistic coefficient is a sectional-density-like quantity (mass per unit
+    frontal area) and is published in lb/in^2. Converting to kg/m^2 therefore
+    requires *both* the pound->kilogram factor and the inch->metre factor:
+
+        BC[kg/m^2] = BC[lb/in^2] * (kg/lb) / (m/in)^2
+
+    The previous implementation omitted the pound->kilogram factor, making the
+    metric BC 1/0.4536 ~= 2.2x too large (and the drag correspondingly too low).
 
     Parameters:
-    bc (float): Ballistic coefficient in imperial units.
+    bc (float): Ballistic coefficient in lb/in^2 (the value printed on a box).
 
     Returns:
-    float: Ballistic coefficient in metric units.
+    float: Ballistic coefficient in kg/m^2.
     """
-    # Correct drag coefficient calculation to handle unit consistency
-    # Convert BC from imperial to metric:
-    inch_to_meter = INCHES_TO_METERS_FACTOR  # Conversion factor from inches to meters
-    bc_metric = bc / inch_to_meter ** 2  # Adjust BC for metric units
-    return bc_metric
+    return bc * POUNDS_TO_KG_FACTOR / INCHES_TO_METERS_FACTOR ** 2
 
-def calculate_drag_coefficient(bc, bullet_mass, bullet_area):  # G1 model for bc
-    """
-    Calculate the drag coefficient.
-
-    Parameters:
-    bc (float): Ballistic coefficient.
-    bullet_mass (float): Mass of the bullet in kg.
-    bullet_area (float): Cross-sectional area of the bullet in m^2.
-
-    Returns:
-    float: Drag coefficient.
-    """
-    return bullet_mass / (bc * bullet_area)
-
-def calculate_drag_force(v, drag_coefficient, bullet_area):
-    """
-    Calculate the drag force on a bullet.
-
-    Parameters:
-    v (float): Velocity of the bullet in m/s.
-    drag_coefficient (float): Drag coefficient.
-    bullet_area (float): Cross-sectional area of the bullet in m^2.
-    Returns:
-    float: Drag force in N.
-    """
-    return 0.5 * drag_coefficient * util.get_air_density() * v ** 2 * bullet_area
 
 def calculate_barrel_angle(hob, poi, d0):
     """
@@ -205,7 +285,7 @@ def calculate_barrel_angle(hob, poi, d0):
 
     Parameters:
     hob (float): Height over bore in meters.
-    k (float): Point of impact in meters (negative if below the target).
+    poi (float): Point of impact offset in meters (negative if below the target).
     d0 (float): Distance to the target in meters.
 
     Returns:
@@ -213,39 +293,39 @@ def calculate_barrel_angle(hob, poi, d0):
     """
     return atan((hob + poi) / d0)  # Angle in radians
 
-def calculate_velocity_at_distance(v0, drag_coefficient, bullet_mass, bullet_area, distance, angle):
+
+def calculate_velocity_at_distance(v0, bc_metric, distance, angle, drag_model=None):
     """
     Calculate the velocity at a given distance using numerical integration.
 
     Parameters:
     v0 (float): Initial velocity in m/s.
-    drag_coefficient (float): Drag coefficient.
-    bullet_mass (float): Mass of the bullet in kg.
-    bullet_area (float): Cross-sectional area of the bullet in m^2.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
     distance (float): Distance to the target in meters.
     angle (float): Barrel angle in radians.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
 
     Returns:
-    float: Velocity at the specified distance in m/s."""
-
+    float: Velocity at the specified distance in m/s.
+    """
     if distance == 0:
         return v0
 
     # Initial conditions
     v0x = v0 * np.cos(angle)  # Initial velocity in x-direction
-    v0y = v0 * np.sin(angle)  # Initial velocity in y-direction (0 for horizontal shot)
+    v0y = v0 * np.sin(angle)  # Initial velocity in y-direction
     v0z = 0  # Initial velocity in z-direction (no initial drift)
     y0 = [0, 0, 0, v0x, v0y, v0z]  # [x0, y0, z0, vx0, vy0, vz0]
 
-    # Increase the estimated time of flight
-    t_max = calculate_time_of_flight(v0, drag_coefficient, bullet_mass, bullet_area, distance, angle) * 2
+    # Estimate time of flight, then integrate well past it.
+    t_max = calculate_time_of_flight(v0, bc_metric, distance, angle, drag_model) * 2
     t_span = [0, t_max]
 
     sol = solve_ivp(
         bullet_dynamics,
         t_span,
         y0,
-        args=(drag_coefficient, bullet_mass, bullet_area),
+        args=(bc_metric, drag_model),
         method='RK45',
         dense_output=True,
         rtol=1e-8,
@@ -271,7 +351,8 @@ def calculate_velocity_at_distance(v0, drag_coefficient, bullet_mass, bullet_are
     vz_before = vz_vals[index - 1]
     vz_after = vz_vals[index]
 
-    interpolate = lambda before, after: before + (distance - x_before) * (after - before) / (x_after - x_before)
+    def interpolate(before, after):
+        return before + (distance - x_before) * (after - before) / (x_after - x_before)
 
     vx_target = interpolate(vx_before, vx_after)
     vy_target = interpolate(vy_before, vy_after)
@@ -282,37 +363,36 @@ def calculate_velocity_at_distance(v0, drag_coefficient, bullet_mass, bullet_are
     return final_velocity
 
 
-def calculate_velocities(v0, drag_coefficient, bullet_mass, bullet_area, distances, angle):
+def calculate_velocities(v0, bc_metric, distances, angle, drag_model=None):
     """
     Calculate velocities at multiple distances.
 
     Parameters:
     v0 (float): Initial velocity in m/s.
-    drag_coefficient (float): Drag coefficient.
-    bullet_mass (float): Mass of the bullet in kg.
-    bullet_area (float): Cross-sectional area of the bullet in m^2.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
     distances (list[float]): List of distances in meters.
+    angle (float): Barrel angle in radians.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
 
     Returns:
     list[float]: List of velocities at each distance in m/s.
     """
-    velocities = []
-    for d in distances:
-        velocities.append(calculate_velocity_at_distance(v0, drag_coefficient, bullet_mass, bullet_area, d, angle))
-    return velocities
+    return [
+        calculate_velocity_at_distance(v0, bc_metric, d, angle, drag_model)
+        for d in distances
+    ]
 
 
-def calculate_time_of_flight(v0, drag_coefficient, bullet_mass, bullet_area, distance, angle):
+def calculate_time_of_flight(v0, bc_metric, distance, angle, drag_model=None):
     """
     Calculate the time of flight to reach a given distance.
 
     Parameters:
     v0 (float): Initial velocity in m/s.
-    drag_coefficient (float): Drag coefficient.
-    bullet_mass (float): Mass of the bullet in kg.
-    bullet_area (float): Cross-sectional area of the bullet in m^2.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
     distance (float): Distance to the target in meters.
-    angle (float): Barrel angle in degrees.
+    angle (float): Barrel angle in radians.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
 
     Returns:
     float: Time of flight in seconds.
@@ -322,137 +402,137 @@ def calculate_time_of_flight(v0, drag_coefficient, bullet_mass, bullet_area, dis
 
     # Initial conditions
     v0x = v0 * np.cos(angle)  # Initial velocity in x-direction
-    v0y = v0 * np.sin(angle)  # Initial velocity in y-direction (0 for horizontal shot)
+    v0y = v0 * np.sin(angle)  # Initial velocity in y-direction
     v0z = 0  # Initial velocity in z-direction (no initial drift)
     y0 = [0, 0, 0, v0x, v0y, v0z]  # [x0, y0, z0, vx0, vy0, vz0]
 
-    # Estimate max flight time using initial horizontal velocity
-    t_max = 1.5 * distance / v0x
+    # Integrate until the bullet crosses the target distance. A terminal event
+    # stops the solver exactly at x == distance, so we never have to guess a
+    # safe upper bound on flight time (drag makes a fixed multiple unreliable
+    # at long range). A generous time ceiling guards against a non-reaching shot.
+    def reached_distance(t, y, *args):
+        return y[0] - distance
+    reached_distance.terminal = True
+    reached_distance.direction = 1
 
-    # Perform numerical integration using Runge-Kutta method
+    t_ceiling = 10.0 * distance / v0x  # Far beyond any real time of flight
     sol = solve_ivp(
         bullet_dynamics,
-        [0, t_max],
+        [0, t_ceiling],
         y0,
-        args=(drag_coefficient, bullet_mass, bullet_area),
-        method='RK45',  # Use default Runge-Kutta method
-        rtol=1e-8,  # Relative tolerance for precision
+        args=(bc_metric, drag_model),
+        method='RK45',
+        events=reached_distance,
+        rtol=1e-8,
         atol=1e-10
     )
 
-    # Capture results
-    x = sol.y[0]  # Horizontal positions
-    y = sol.y[1]  # Vertical positions
-
-    # Find the time when the bullet reaches the target distance
-    distances = sol.y[0]
-    index = np.argmax(distances >= distance)
-    if index == 0:
+    if sol.t_events[0].size == 0:
         raise RuntimeError("Solution did not reach the specified distance.")
 
-    # Interpolate the time at which the bullet reaches the exact distance
-    x_before = distances[index - 1]
-    x_after = distances[index]
-    t_before = sol.t[index - 1]
-    t_after = sol.t[index]
-
-    # Linear interpolation for time at the exact distance
-    t_target = t_before + (distance - x_before) * (t_after - t_before) / (x_after - x_before)
-
-    return t_target
+    return float(sol.t_events[0][0])
 
 
-def calculate_time_of_flights(v0, drag_coefficient_g1, bullet_mass, bullet_area, distances, angle):
+def calculate_time_of_flights(v0, bc_metric, distances, angle, drag_model=None):
     """
-    Calculate the time of flights to reach multiple distances.
+    Calculate the time of flight to reach multiple distances.
 
     Parameters:
     v0 (float): Initial velocity in m/s.
-    drag_coefficient_g1 (float): Drag coefficient.
-    bullet_mass (float): Mass of the bullet in kg.
-    bullet_area (float): Cross-sectional area of the bullet in m^2.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
     distances (list[float]): List of distances in meters.
-    angle (float): Barrel angle in degrees.
+    angle (float): Barrel angle in radians.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
 
     Returns:
-    list[float]: List of time of flights to each distance in seconds.
+    list[float]: List of times of flight to each distance in seconds.
     """
-    time_to_distances = []
-    for d in distances:
-        time_to_distances.append(
-            calculate_time_of_flight(v0, drag_coefficient_g1, bullet_mass, bullet_area, d, angle))
-    return time_to_distances
+    return [
+        calculate_time_of_flight(v0, bc_metric, d, angle, drag_model)
+        for d in distances
+    ]
 
-def calculate_poi(v0, d_target, drag_coefficient, bullet_mass, bullet_area, hob, angle):
+
+def calculate_poi(v0, d_target, bc_metric, hob, angle, drag_model=None):
     """
-    Calculate the point of impact (POI) at a given target distance using numerical integration.
+    Calculate the point of impact (POI) at a given target distance.
 
     Parameters:
-    d_target (float): Target distance in meters.
-    drag_coefficient (float): Drag coefficient.
-    bullet_mass (float): Mass of the bullet in kg.
-    bullet_area (float): Cross-sectional area of the bullet in m^2.
-    hob (float): Height over bore in meters.
     v0 (float): Initial velocity in m/s.
+    d_target (float): Target distance in meters.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
+    hob (float): Height over bore in meters.
     angle (float): Barrel angle in radians.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
 
     Returns:
-    float: Final vertical position at the target distance in meters.
+    float: Vertical position relative to the line of sight at the target (m).
     """
     if d_target == 0:
-        # For zero distance, return the initial height above ground level
+        # No meaningful point of impact at zero distance.
         return np.nan
 
     # Initial conditions
     v0x = v0 * np.cos(angle)  # Initial velocity in x-direction
-    v0y = v0 * np.sin(angle)  # Initial velocity in y-direction (0 for horizontal shot)
+    v0y = v0 * np.sin(angle)  # Initial velocity in y-direction
     v0z = 0  # Initial velocity in z-direction (no initial drift)
 
-    y0 = [0, hob, 0, v0x, v0y, v0z]  # [x0, y0, z0, vx0, vy0, vz0]
+    # The line of sight is the reference (y = 0). The bore sits `hob` below it
+    # (sight height over bore), so the bullet launches from y = -hob. The drop
+    # at the target is then the bullet's height read directly against y = 0.
+    # (Launching at +hob and subtracting hob would cancel, making sight height
+    # a no-op -- which is wrong: sight height must affect the near trajectory.)
+    y0 = [0, -hob, 0, v0x, v0y, v0z]  # [x0, y0, z0, vx0, vy0, vz0]
 
-    t_max = d_target / v0x
-    # Ensure t_eval is a 1-dimensional array
-    t_eval = np.linspace(0, t_max, 1000)
+    # Integrate until the bullet actually crosses x = d_target. Using a fixed
+    # window of d_target / v0x assumes no slowdown, so with drag the bullet
+    # would not reach the target within the window and the drop would be read
+    # short -- underestimating it, worse at long range. A terminal event stops
+    # the solver exactly at x == d_target.
+    def reached_distance(t, y, *args):
+        return y[0] - d_target
+    reached_distance.terminal = True
+    reached_distance.direction = 1
 
-    # Use adaptive integration (Runge-Kutta method)
-    # sol = solve_ivp(bullet_dynamics, [0, t_max], y0, args=(drag_coefficient, bullet_mass), t_eval=t_eval)
-
+    t_ceiling = 10.0 * d_target / v0x  # Far beyond any real time of flight
     sol = solve_ivp(
         bullet_dynamics,
-        [0, t_max],
+        [0, t_ceiling],
         y0,
-        args=(drag_coefficient, bullet_mass, bullet_area),
-        t_eval=t_eval,
-        method='RK45',  # More stable for complex problems
-        rtol=1e-8,  # Relative tolerance for precision
+        args=(bc_metric, drag_model),
+        method='RK45',
+        events=reached_distance,
+        rtol=1e-8,
         atol=1e-10
     )
 
-    x = sol.y[0]  # Horizontal positions
-    y = sol.y[1]  # Vertical positions
+    if sol.t_events[0].size == 0:
+        # Bullet never reached the target distance (e.g. it fell to ground).
+        return np.nan
 
-    return y[-1] - hob  # Difference between final y position and initial height
+    # y at the event time is the height (relative to the line of sight) exactly
+    # at x = d_target.
+    return float(sol.y_events[0][0][1])
 
 
-def calculate_pois(v0, drag_coefficient, bullet_mass, bullet_area, hob, angle, distances):
+def calculate_pois(v0, bc_metric, hob, angle, distances, drag_model=None):
     """
-    Calculate points of impact (POIs) for multiple distances using numerical integration.
+    Calculate points of impact (POIs) for multiple distances.
 
     Parameters:
-    drag_coefficient (float): Drag coefficient.
-    bullet_mass (float): Mass of the bullet in kg.
-    bullet_area (float): Cross-sectional area of the bullet in m^2.
-    hob (float): Height over bore in meters.
     v0 (float): Initial velocity in m/s.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
+    hob (float): Height over bore in meters.
     angle (float): Barrel angle in radians.
-    distances (array-like): Array of distances in meters at which to compute POIs.
+    distances (array-like): Distances in meters at which to compute POIs.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
 
     Returns:
     np.array: Array of points of impact for each distance.
     """
     pois = []
     for d in distances:
-        poi = calculate_poi(v0, d, drag_coefficient, bullet_mass, bullet_area, hob, angle)
+        poi = calculate_poi(v0, d, bc_metric, hob, angle, drag_model)
         if np.isinf(poi):
             print(f"Warning: Integration failed for distance {d}. POI set to NaN.")
             pois.append(np.nan)
@@ -466,11 +546,11 @@ def poi_to_mrad(poi, d):
     Convert point of impact (POI) to milliradians (mrad).
 
     Parameters:
-    k (float): Point of impact in meters.
+    poi (float): Point of impact in meters.
     d (float): Distance to the target in meters.
 
     Returns:
-    float: Point of impact in milliradians (mrad).
+    float: Required scope correction in milliradians (mrad).
     """
     if d == 0:
         return 0
@@ -479,152 +559,230 @@ def poi_to_mrad(poi, d):
 
 def calculate_mrads(distances, pois):
     """
-    Calculate the elevation angle in milliradians (mrad) for multiple distances.
+    Calculate the elevation correction in milliradians (mrad) for many distances.
 
     Parameters:
     distances (list[float]): List of distances in meters.
     pois (list[float]): List of points of impact in meters.
 
     Returns:
-    list[float]: List of elevation angles in milliradians (mrad).
+    list[float]: List of elevation corrections in milliradians (mrad).
     """
     mrads: list[int | float] = []
     for i in range(len(distances)):
         mrads.append(poi_to_mrad(pois[i], distances[i]))
     return mrads
 
+
 def angle_to_mrads(angle: float, distance: float) -> float:
     return angle / distance * 1000.0
 
-def calculate_coriolis_drifts(v0, drag_coefficient, bullet_mass, bullet_area, distances, latitude):
+
+def calculate_coriolis_drifts(v0, bc_metric, distances, latitude, azimuth=90.0, drag_model=None):
     """
-    Calculate the Coriolis effect using the solve_ivp method over an array of distances, accounting for drag.
+    Coriolis deflection of the trajectory, accounting for drag.
+
+    The Coriolis acceleration is 2 * Omega x v, where Omega is the Earth's
+    rotation vector. In a local frame with x downrange (horizontal), y up, and
+    z to the right of the line of fire, and for a firing azimuth measured
+    clockwise from true north, the relevant components are:
+
+        a_horizontal (z, rightward) = 2 * Omega * (vx * sin(lat)
+                                                    - vy * cos(lat) * cos(az))
+        a_vertical   (y, up)        = 2 * Omega * vx * cos(lat) * sin(az)
+
+    The horizontal term is the classic latitude-dependent azimuthal drift; the
+    vertical term raises or lowers the impact depending on firing direction.
 
     Parameters:
-    v0 (float): Initial horizontal velocity of the object (m/s)
-    drag_coefficient (float): Drag coefficient of the bullet
-    bullet_mass (float): Mass of the bullet (kg)
-    bullet_area (float): Cross-sectional area of the bullet (m^2)
-    distances (list): Array of distances in meters (cumulative steps)
-    latitude (float): Latitude in degrees
+    v0 (float): Muzzle velocity in m/s.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
+    distances (list[float]): Distances in meters at which to report drift.
+    latitude (float): Latitude in degrees (positive north).
+    azimuth (float): Firing azimuth in degrees clockwise from north. Default 90
+        (due east), which maximizes the vertical component and gives the
+        canonical horizontal drift.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
 
     Returns:
-    tuple: A tuple containing the total drift and a list of drifts at each step
+    tuple: (total_horizontal_drift, horizontal_drifts, vertical_drifts) in meters.
     """
-
-    def coriolis_ode(t, state, drag_coefficient, bullet_area, bullet_mass, omega, phi):
-        """
-        Computes derivatives for the Coriolis effect ODE, accounting for drag.
-
-        Parameters:
-        state (list): Current state [vx, x_drift]
-        v0 (float): Initial horizontal velocity of the object (m/s)
-        drag_coefficient (float): Drag coefficient of the bullet
-        bullet_area (float): Cross-sectional area of the bullet (m^2)
-        bullet_mass (float): Mass of the bullet (kg)
-        omega (float): Angular velocity of the Earth in rad/s
-        phi (float): Latitude in radians
-
-        Returns:
-        list: Derivatives [dvx/dt, dx_drift/dt]
-        """
-        vx, x_drift = state
-
-        # Calculate drag force and acceleration
-        drag = calculate_drag_force(vx, drag_coefficient, bullet_area)
-        a_drag = drag / bullet_mass
-
-        # Coriolis effect component in x-direction
-        a_coriolis = 2 * vx * omega * np.sin(phi)
-
-        # Derivatives
-        dvx_dt = -a_drag
-        dx_drift_dt = a_coriolis
-
-        return [dvx_dt, dx_drift_dt]
-
-    omega = 7.2921e-5  # Angular velocity of the Earth in rad/s
     phi = np.radians(latitude)
+    az = np.radians(azimuth)
+    sin_phi, cos_phi = np.sin(phi), np.cos(phi)
+    sin_az, cos_az = np.sin(az), np.cos(az)
 
-    # Initial conditions: velocity and drift
-    init_state = [v0, 0]
+    def coriolis_ode(t, state):
+        # State: downrange velocity vx and the accumulated horizontal/vertical drift.
+        vx, z_drift, vz, y_drift, vy = state
 
-    # Solve the ODE
+        # Drag deceleration along the line of fire (point-mass, near-horizontal).
+        cd_ref = _ref_cd(vx, drag_model)
+        k = (pi / 8.0) * util.get_air_density() * cd_ref / bc_metric
+        a_drag = k * vx * vx
+
+        # Coriolis accelerations (small relative to drag; integrated for drift).
+        a_z = 2 * EARTH_OMEGA * (vx * sin_phi - vy * cos_phi * cos_az)
+        a_y = 2 * EARTH_OMEGA * vx * cos_phi * sin_az
+
+        return [-a_drag, vz, a_z, vy, a_y]
+
+    init_state = [v0, 0.0, 0.0, 0.0, 0.0]
+
     sol = solve_ivp(
         coriolis_ode,
-        [0, distances[-1] / v0],  # Time span: from 0 to the time it takes to travel the maximum distance
+        [0, distances[-1] / v0],
         init_state,
-        args=(drag_coefficient, bullet_area, bullet_mass, omega, phi),
-        t_eval=[d / v0 for d in distances]  # Evaluation points based on distances
+        t_eval=[d / v0 for d in distances],
+        rtol=1e-9,
+        atol=1e-12,
     )
 
-    # Extract results
-    drifts = sol.y[1]
-    total_drift = drifts[-1]
+    horizontal_drifts = sol.y[1]
+    vertical_drifts = sol.y[3]
+    total_drift = horizontal_drifts[-1]
 
-    return total_drift, drifts
+    return total_drift, horizontal_drifts, vertical_drifts
 
 
-def calculate_spin_drift(v0, drag_coefficient, target_distance, bullet_mass, bullet_area, twist_rate, angle):
+def miller_stability_factor(twist_rate, bullet_length, bullet_diameter, bullet_mass):
     """
-    Calculate the spin drift of a bullet at a given target distance.
+    Miller gyroscopic stability factor Sg (dimensionless).
+
+        Sg = 30 * m / (t^2 * d^3 * l * (1 + l^2))
+
+    with mass m in grains, twist t in calibers/turn, and diameter d and length l
+    in calibers (l = length / diameter). All inputs to this function are SI.
 
     Parameters:
-    v0 (float): Initial velocity of the bullet in m/s.
-    drag_coefficient (float): Drag coefficient of the bullet.
-    target_distance (float): Distance to the target in meters.
-    bullet_mass (float): Mass of the bullet in kg.
-    bullet_area (float): Cross-sectional area of the bullet in m^2.
-    twist_rate (float): Twist rate of the barrel in meters.
-    param angle (float): Barrel angle in radians
+    twist_rate (float): Barrel twist (length per turn) in meters.
+    bullet_length (float): Bullet length in meters.
+    bullet_diameter (float): Bullet diameter in meters.
+    bullet_mass (float): Bullet mass in kg.
 
     Returns:
-    float: Adjusted spin drift in meters.
+    float: Miller stability factor Sg.
     """
-    # Calculate velocity at the given distance considering drag
-    velocity = calculate_velocity_at_distance(v0, drag_coefficient, bullet_mass, bullet_area, target_distance, angle)
+    mass_grains = bullet_mass / GRAINS_TO_KG_FACTOR
+    diameter_in = bullet_diameter / INCHES_TO_METERS_FACTOR
+    length_cal = bullet_length / bullet_diameter
+    twist_cal = twist_rate / bullet_diameter
 
-    # Bullet spin rate (radians per second)
-    spin_rate = (2 * pi * velocity) / twist_rate
-
-    # Empirical constant for spin drift (this value can be adjusted based on experimental data)
-    k = 2.25e-6  # Adjust based on bullet type
-    # Simplified estimation of the gyroscopic effect
-    spin_drift = (spin_rate * target_distance ** 2) / (v0 ** 2)
-
-    # Multiply by empirical constant
-    adjusted_spin_drift = k * spin_drift
-
-    return adjusted_spin_drift
+    return (30.0 * mass_grains) / (
+        twist_cal ** 2 * diameter_in ** 3 * length_cal * (1.0 + length_cal ** 2)
+    )
 
 
-def calculate_spin_drifts(v0, distances, drag_coefficient, bullet_mass, bullet_area, twist_rate, angle):
-    drifts = []
-    for d in distances:
-        drifts.append(calculate_spin_drift(v0, drag_coefficient, d, bullet_mass, bullet_area, twist_rate, angle))
-    return drifts
+def calculate_spin_drift(v0, bc_metric, target_distance, twist_rate, bullet_length,
+                         bullet_diameter, bullet_mass, angle, drag_model=None):
+    """
+    Spin (gyroscopic) drift using the Litz approximation.
+
+    The drift of a right-hand-twist bullet is, to good approximation,
+
+        drift[in] = 1.25 * (Sg + 1.2) * tof^1.83
+
+    where tof is the time of flight in seconds and Sg is the Miller gyroscopic
+    stability factor (see `miller_stability_factor`). The result is in meters.
+
+    Parameters:
+    v0 (float): Muzzle velocity in m/s.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
+    target_distance (float): Distance to the target in meters.
+    twist_rate (float): Barrel twist (length per turn) in meters.
+    bullet_length (float): Bullet length in meters.
+    bullet_diameter (float): Bullet diameter in meters.
+    bullet_mass (float): Bullet mass in kg.
+    angle (float): Barrel angle in radians.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
+
+    Returns:
+    float: Spin drift in meters (positive = right, for right-hand twist).
+    """
+    tof = calculate_time_of_flight(v0, bc_metric, target_distance, angle, drag_model)
+    sg = miller_stability_factor(twist_rate, bullet_length, bullet_diameter, bullet_mass)
+
+    # Litz spin-drift approximation (inches), then convert to meters.
+    drift_inches = 1.25 * (sg + 1.2) * (tof ** 1.83)
+    return drift_inches * INCHES_TO_METERS_FACTOR
+
+
+def calculate_aerodynamic_jump(twist_rate, bullet_length, bullet_diameter, bullet_mass,
+                               crosswind_speed):
+    """
+    Aerodynamic jump: the vertical deflection a crosswind imparts via the
+    bullet's gyroscopic response, expressed as a (range-independent) angle.
+
+    A crosswind makes a spin-stabilized bullet jump vertically. Litz gives the
+    angle (independent of range, to first order) as
+
+        AJ[mrad] = -0.01 * Sg * crosswind[mph]
+
+    where Sg is the Miller stability factor and the crosswind is the component
+    perpendicular to the line of fire. For a right-hand twist, a left-to-right
+    crosswind produces a downward jump (negative); the sign flips for the
+    opposite wind. Applied Ballistics includes this term in its elevation, which
+    is why a right-twist rifle reads a small vertical offset even at its zero.
+
+    Parameters:
+    twist_rate (float): Barrel twist (length per turn) in meters.
+    bullet_length (float): Bullet length in meters.
+    bullet_diameter (float): Bullet diameter in meters.
+    bullet_mass (float): Bullet mass in kg.
+    crosswind_speed (float): Crosswind component in m/s (positive left-to-right).
+
+    Returns:
+    float: Aerodynamic jump angle in milliradians (added to the elevation).
+    """
+    sg = miller_stability_factor(twist_rate, bullet_length, bullet_diameter, bullet_mass)
+    crosswind_mph = crosswind_speed / 0.44704  # m/s -> mph
+    return -0.01 * sg * crosswind_mph
+
+
+def calculate_spin_drifts(v0, distances, bc_metric, twist_rate, bullet_length,
+                          bullet_diameter, bullet_mass, angle, drag_model=None):
+    """Spin drift at each of several distances (meters). See `calculate_spin_drift`."""
+    return [
+        calculate_spin_drift(v0, bc_metric, d, twist_rate, bullet_length,
+                             bullet_diameter, bullet_mass, angle, drag_model)
+        for d in distances
+    ]
+
 
 # Windage calculations
 
-def calculate_wind_drift_at_distance(v0, drag_coefficient, bullet_mass, bullet_area, wind_speed, wind_angle, distance, angle):
+def calculate_wind_drift_at_distance(v0, bc_metric, wind_speed, wind_angle, distance, angle,
+                                     drag_model=None):
+    """
+    Crosswind drift at a single distance (meters).
+
+    Parameters:
+    v0 (float): Muzzle velocity in m/s.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
+    wind_speed (float): Wind speed in m/s.
+    wind_angle (float): Wind direction in radians, relative to the line of fire.
+    distance (float): Distance to the target in meters.
+    angle (float): Barrel angle in radians.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
+    """
     if distance == 0:
         return 0
 
     # Initial conditions
     v0x = v0 * np.cos(angle)  # Initial velocity in x-direction
-    v0y = v0 * np.sin(angle)  # Initial velocity in y-direction (0 for horizontal shot)
+    v0y = v0 * np.sin(angle)  # Initial velocity in y-direction
     v0z = 0  # Initial velocity in z-direction (no initial drift)
     y0 = [0, 0, 0, v0x, v0y, v0z]  # [x0, y0, z0, vx0, vy0, vz0]
 
-    # Increase the estimated time of flight
-    t_max = calculate_time_of_flight(v0, drag_coefficient, bullet_mass, bullet_area, distance, angle) * 2
+    # Integrate well past the expected time of flight.
+    t_max = calculate_time_of_flight(v0, bc_metric, distance, angle, drag_model) * 2
     t_span = [0, t_max]
 
     sol = solve_ivp(
         bullet_dynamics,
         t_span,
         y0,
-        args=(drag_coefficient, bullet_mass, bullet_area, wind_speed, wind_angle),
+        args=(bc_metric, drag_model, wind_speed, wind_angle),
         method='LSODA',
         dense_output=True,
         rtol=1e-8,
@@ -648,187 +806,174 @@ def calculate_wind_drift_at_distance(v0, drag_coefficient, bullet_mass, bullet_a
     return z_target
 
 
-def calculate_wind_drifts(v0, drag_coefficient, bullet_mass, bullet_area, distances, wind_speed, wind_angle, angle):
+def calculate_wind_drifts(v0, bc_metric, distances, wind_speed, wind_angle, angle,
+                          drag_model=None):
     """
-    Calculate wind drifts at multiple distances.
+    Crosswind drift at multiple distances (meters).
 
     Parameters:
-    v0 (float): Initial velocity in m/s.
-    drag_coefficient (float): Drag coefficient.
-    bullet_mass (float): Mass of the bullet in kg.
-    bullet_area (float): Cross-sectional area of the bullet in m^2.
-    distances (list[float]): List of distances in meters.
+    v0 (float): Muzzle velocity in m/s.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
+    distances (list[float]): Distances in meters.
     wind_speed (float): Wind speed in m/s.
-    wind_angle (float): Wind angle in degrees.
-    angle (float): barrel angle in degrees.
-
-    Returns:
-    list[float]: List of wind drifts at each distance in meters.
+    wind_angle (float): Wind direction in radians, relative to the line of fire.
+    angle (float): Barrel angle in radians.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
     """
-    drifts = []
-    for d in distances:
-        drifts.append(
-            calculate_wind_drift_at_distance(v0, drag_coefficient, bullet_mass, bullet_area, wind_speed, wind_angle, d, angle))
-    return drifts
+    return [
+        calculate_wind_drift_at_distance(v0, bc_metric, wind_speed, wind_angle, d, angle, drag_model)
+        for d in distances
+    ]
 
-def calculate_mpbr(v0, drag_coefficient, bullet_mass, bullet_area, target_size, hob, d_zero, angle):
+
+def calculate_mpbr(v0, bc_metric, target_size, hob, d_zero, angle, drag_model=None):
     """
     Calculate the Maximum Point Blank Range (MPBR) for a bullet.
 
-    v0: Initial velocity (m/s).
-    drag_coefficient: Drag coefficient.
-    bullet_mass: Mass of the bullet (kg).
-    bullet_area: Cross-sectional area of the bullet (m^2).
-    air_density: Air density (kg/m^3).
-    target_size: Vertical size of the target (m).
-    sight_height: Height of the sight above the bore (m), default is 0.
-    zero_distance: Distance at which the rifle is zeroed (m), default is 100 m.
+    Parameters:
+    v0 (float): Muzzle velocity in m/s.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
+    target_size (float): Vertical size of the target in meters.
+    hob (float): Height over bore (sight height) in meters.
+    d_zero (float): Zero distance in meters (used to bound the integration time).
+    angle (float): Barrel angle in radians.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
 
-    Returns: The MPBR (m).
+    Returns:
+    float: The MPBR in meters.
     """
-    # Define the allowable vertical deviation (half the target size)
-    max_rise = target_size / 2  # The maximum allowed rise
-    max_fall = target_size / 2  # The maximum allowed fall below the line of sight
+    max_rise = target_size / 2  # Maximum allowed rise above the line of sight
+    max_fall = target_size / 2  # Maximum allowed fall below the line of sight
 
     # Initial conditions
     v0x = v0 * np.cos(angle)  # Initial velocity in x-direction
-    v0y = v0 * np.sin(angle)  # Initial velocity in y-direction (0 for horizontal shot)
+    v0y = v0 * np.sin(angle)  # Initial velocity in y-direction
     v0z = 0  # No initial lateral velocity (z-direction)
 
-    # Initial state for the bullet's motion, considering sight height
+    # Start at the bore, sight height below the line of sight.
     y0 = [0, -hob, 0, v0x, v0y, v0z]  # [x0, y0, z0, vx0, vy0, vz0]
 
-    # Estimate the maximum time of flight based on typical flight times
-    t_max = calculate_time_of_flight(v0, drag_coefficient, bullet_mass, bullet_area, d_zero, angle) * 2
+    t_max = calculate_time_of_flight(v0, bc_metric, d_zero, angle, drag_model) * 2
     t_span = [0, t_max]
 
-    # Solve the ODE using your bullet_dynamics function
     sol = solve_ivp(
-        bullet_dynamics,  # Your dynamics function
+        bullet_dynamics,
         t_span,
         y0,
-        args=(drag_coefficient, bullet_mass, bullet_area),
+        args=(bc_metric, drag_model),
         method='LSODA',
         dense_output=True,
         rtol=1e-8,
         atol=1e-10
     )
 
-    # Extract horizontal positions (x) and vertical positions (y)
     x_vals = sol.y[0]  # Horizontal positions (distance)
-    y_vals = sol.y[1]  # Vertical positions (height)
+    y_vals = sol.y[1]  # Vertical positions (height vs line of sight)
 
-    # Find the maximum distance where the bullet's height stays within the allowed limits
     mpbr = 0  # Initialize MPBR
 
     for x, y in zip(x_vals, y_vals):
-        # Check if the bullet's height is within the acceptable rise and fall range
         if -max_fall <= y <= max_rise:
-            mpbr = x  # Update MPBR to the current distance where it's within the target size
+            mpbr = x  # Still within the target window
         else:
-            break  # Once the bullet goes outside the acceptable range, stop
+            break  # Bullet has left the acceptable window
 
     return mpbr
+
 
 def calculate_hold_mrad(target_speed, target_distance, target_angle, flight_time):
     """
     Calculate the hold (lead) for a moving target in milliradians (mrad).
 
     Parameters:
-    target_speed (float): Speed of the target in meters per second (m/s).
-    target_distance (float): Distance to the target in meters (m).
-    target_angle (float): Angle of the target's motion in degrees.
-    flight_time (float): Flight time of the projectile in seconds (s).
+    target_speed (float): Speed of the target in m/s.
+    target_distance (float): Distance to the target in meters.
+    target_angle (float): Angle of the target's motion in degrees (0 = directly
+        crossing the line of sight, 90 = moving along it).
+    flight_time (float): Flight time of the projectile in seconds.
 
     Returns:
     float: Required hold (lead) in milliradians (mrad).
-    :param target_angle:
     """
-    # The hold is the product of the target's speed and the flight time of the projectile
-
-    if target_distance <=0:
+    if target_distance <= 0:
         return 0
+    # Only the cross-line-of-sight component of motion needs a lead.
     hold_m = target_speed * flight_time * math.cos(radians(target_angle))
-    # Convert hold to milliradians
     hold_mrad = (hold_m / target_distance) * 1000
     return hold_mrad
+
 
 def create_hold_table(vt_arr, d_arr, t_arr, target_angle=0):
     """
     Create a table of holds for a range of target speeds and distances.
 
     Parameters:
-    vt_arr (array-like): Array of target speeds in km/hob.
+    vt_arr (array-like): Array of target speeds in km/h.
     d_arr (array-like): Array of distances to the target in meters.
+    t_arr (array-like): Flight times in seconds, one per distance in d_arr.
+    target_angle (float): Angle of target motion in degrees.
 
     Returns:
-    np.array: 2D array of holds in milliradians (mrad).
+    np.array: 2D array of holds in milliradians (mrad), indexed [distance, speed].
     """
-    # Check that the lengths of d_arr and t_arr are the same
     if len(d_arr) != len(t_arr):
-        raise ValueError("Distances, velocities and flight times arrays must be the same length.")
+        raise ValueError("Distances and flight times arrays must be the same length.")
 
-    # Initialize an empty table to store the holds
-    hold_table = np.zeros((len(vt_arr), len(d_arr)))
-    # Recalculate velocities to m/s
+    hold_table = np.zeros((len(d_arr), len(vt_arr)))
+    # Convert target speeds from km/h to m/s.
     vt_arr = np.array(vt_arr) * KMH_TO_MPS
 
-    # Calculate the hold for each combination of target speed and distance
     for i, vt in enumerate(vt_arr):
         for j, d in enumerate(d_arr):
             hold_table[j, i] = np.round(calculate_hold_mrad(vt, d, target_angle, t_arr[j]), 1)
     return hold_table
 
-def calculate_projectile_3d_trajectory(v0, drag_coefficient, distance, bullet_weight, bullet_area,
-                                       angle, hob, wind_speed=0, wind_angle=0, dt=0.01):
-    """
-    Simulate 3D bullet trajectory and stop integration exactly at given distance.
-    """
 
+def calculate_projectile_3d_trajectory(v0, bc_metric, distance, angle, wind_speed=0, wind_angle=0,
+                                       dt=0.01, drag_model=None):
+    """
+    Compute the projectile trajectory in 3D space at discrete time intervals.
+
+    Parameters:
+    v0 (float): Muzzle velocity in m/s.
+    bc_metric (float): Ballistic coefficient in kg/m^2.
+    distance (float): Nominal target distance in meters (bounds the integration).
+    angle (float): Barrel angle in radians.
+    wind_speed (float): Wind speed in m/s.
+    wind_angle (float): Wind direction in degrees, relative to the line of fire.
+    dt (float): Output time step in seconds.
+    drag_model (DragModel | None): Standard drag function (G1/G7). Defaults to G1.
+
+    Returns:
+    x_vals, y_vals, z_vals, t_eval: Position arrays and the time grid.
+    """
+    # Convert wind angle to radians (the dynamics expect radians).
     wind_angle = np.radians(wind_angle)
-    v0x = v0 * np.cos(angle)
-    v0y = v0 * np.sin(angle)
-    v0z = 0.0
-    y0 = [0.0, hob, 0.0, v0x, v0y, v0z]
+
+    # Initial conditions
+    v0x = v0 * np.cos(angle)  # Initial velocity in x-direction
+    v0y = v0 * np.sin(angle)  # Initial velocity in y-direction
+    v0z = 0  # Initial velocity in z-direction (no initial drift)
+    y0 = [0, 0, 0, v0x, v0y, v0z]
+
+    # Time span
     t_max = 1.5 * distance / v0x
-    t_eval = np.arange(0, t_max, dt)
-
-    def make_stop_at_distance_event(target_x):
-        def event(t, y, *args):
-            return y[0] - target_x
-        event.terminal = True
-        event.direction = 1
-        return event
-
-    stop_event = make_stop_at_distance_event(distance)
+    t_span = (0, t_max)
+    t_eval = np.arange(0, t_max, dt)  # Discrete time intervals
 
     sol = solve_ivp(
-        fun=bullet_dynamics,
-        t_span=(0, t_max),
-        y0=y0,
-        args=(drag_coefficient, bullet_weight, bullet_area, wind_speed, wind_angle),
+        bullet_dynamics,
+        t_span,
+        y0,
         t_eval=t_eval,
-        events=stop_event,
+        args=(bc_metric, drag_model, wind_speed, wind_angle),
         method='LSODA',
-        dense_output=True,  # <--- important
         rtol=1e-8,
         atol=1e-10
     )
 
-    if sol.t_events[0].size > 0:
-        impact_time = sol.t_events[0][0]
-        dense_point = sol.sol(impact_time)  # interpolated state [x, y, z, vx, vy, vz]
-
-        mask = sol.t < impact_time
-        x_vals = np.append(sol.y[0][mask], dense_point[0])
-        y_vals = np.append(sol.y[1][mask], dense_point[1])
-        z_vals = np.append(sol.y[2][mask], dense_point[2])
-        t_eval = np.append(sol.t[mask], impact_time)
-    else:
-        x_vals = sol.y[0]
-        y_vals = sol.y[1]
-        z_vals = sol.y[2]
-        t_eval = sol.t
+    x_vals = sol.y[0]
+    y_vals = sol.y[1]
+    z_vals = sol.y[2]
 
     return x_vals, y_vals, z_vals, t_eval
-
